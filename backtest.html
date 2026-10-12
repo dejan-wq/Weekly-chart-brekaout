@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Breakout Backtest</title>
+<style>
+:root{--bg:#0b0f17;--card:#131a26;--line:#223049;--tx:#e6edf7;--mut:#8a9bb4;--ok:#22c55e;--bad:#ef4444;--acc:#58a6ff;--warn:#f59e0b}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:16px 16px 60px}
+h1{font-size:22px;margin:6px 0 2px}h2{font-size:16px;margin:0 0 8px}
+.sub{color:var(--mut);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}
+.warn{border-color:#5b4510;background:#1d1708}
+button{background:var(--acc);color:#04111f;border:0;border-radius:10px;padding:12px 16px;font-weight:700;font-size:15px;width:100%}
+button.sec{background:#1c2638;color:var(--tx);border:1px solid var(--line)}
+button:disabled{opacity:.5}
+select,input{background:#0e1522;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:9px;font-size:14px;width:100%}
+label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.bar{height:8px;background:#0e1522;border-radius:6px;overflow:hidden;margin-top:10px}.bar>i{display:block;height:100%;width:0;background:var(--acc)}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:7px 4px;text-align:right;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}th{color:var(--mut);font-weight:600;font-size:11px}
+.pos{color:var(--ok)}.neg{color:var(--bad)}.best td{background:#0f2236}
+.pill{display:inline-block;border-radius:99px;padding:3px 10px;font-weight:700;font-size:13px}
+.v-ok{background:#0f2a1a;color:var(--ok)}.v-no{background:#2a1111;color:var(--bad)}.v-mid{background:#2a2108;color:var(--warn)}
+small{color:var(--mut)}#log{font-size:12px;color:var(--mut);margin-top:8px;white-space:pre-wrap}
+.scroll{overflow-x:auto}
+</style></head><body><div class="wrap">
+<h1>Breakout Backtest</h1>
+<div class="sub">Tests the scanner's own rules on past weekly charts. Nothing here trades or connects to an exchange.</div>
+
+<div class="card warn"><h2>Read this first</h2>
+<div class="sub" style="color:#d9c48a">The coin list is today's top 200, so coins that crashed or were delisted are missing. That flatters the results (survivorship bias). Treat good numbers as an upper limit, not a promise. Costs are included: fees plus slippage on every entry and exit.</div></div>
+
+<div class="card">
+<div class="row"><div><label>Fee per trade side (%)</label><input id="fee" type="number" step="0.01" value="0.10"></div>
+<div><label>Slippage per side (%)</label><input id="slip" type="number" step="0.05" value="0.20"></div></div>
+<div style="height:10px"></div>
+<button id="run">Run backtest</button>
+<div class="bar"><i id="pb"></i></div><div id="log"></div>
+</div>
+
+<div id="out" style="display:none">
+<div class="card"><h2>Verdict</h2><div id="verdict"></div></div>
+<div class="card"><h2>Filters</h2>
+<div class="row"><div><label>Signals</label><select id="f_type"><option value="both">Early breakout + near breakout</option><option value="early">Early breakout only</option><option value="near">Near breakout only</option></select></div>
+<div><label>Bitcoin backdrop</label><select id="f_btc"><option value="all">Ignore Bitcoin</option><option value="notbear">Skip when Bearish</option><option value="bull">Only when Bullish</option></select></div></div>
+<div class="row"><div><label>Trader rules (out of 5)</label><select id="f_pro"><option value="0">No filter</option><option value="3">At least 3</option><option value="4">At least 4</option><option value="5">All 5</option></select></div>
+<div><label>Period</label><select id="f_per"><option value="all">Whole history</option><option value="h1">First half</option><option value="h2">Second half</option></select></div></div>
+</div>
+<div class="card"><h2>Stop and exit combinations</h2><div class="sub">Sorted by average result per unit of risk (R). 1R = what you lose if the stop is hit.</div>
+<div class="scroll"><table id="tbl"></table></div></div>
+<div class="card"><h2>Does the Bitcoin filter help?</h2><div class="sub">Best combination above, under each Bitcoin setting.</div><div class="scroll"><table id="btctbl"></table></div></div>
+<div class="card"><h2>Does it hold up over time?</h2><div class="sub">Best combination, first half of the history against the second half.</div><div class="scroll"><table id="pertbl"></table></div></div>
+<div class="card"><small>Columns: Win = share of trades that made money. Avg = average return per trade after costs. R = average gain in units of risk. PF = total profits divided by total losses (above 1.3 is decent). Max DD = worst drop of an account risking 1% per trade, trades in signal order. Trades overlapping in time are not limited, so real results with a position cap would differ.</small></div>
+</div>
+</div>
+<script>
+const QS=new URLSearchParams(location.search);
+const CFG={ // tweak via the page URL, e.g. ?minrules=3&maxdist=8
+  TOP_N:200, MAX_DIST:+(QS.get('maxdist')||6), MIN_RULES:+(QS.get('minrules')||4),
+  LOOKBACK:4, MAX_EXT:15, MIN_VOL:QS.has('minvol')?+QS.get('minvol'):5e6, MIN_WEEKS:40,
+  NEWS_DAYS:14, NEWS_MAX:8, CONC:3
+};
+const EXCLUDE=new Set(['btc','usdt','usdc','dai','usde','fdusd','tusd','usds','pyusd','usdd','usdy','usd1','wbtc','weth','steth','wsteth','weeth','cbbtc','bsc-usd','wbeth','usdt0','susde','buidl']);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const fmt=p=>p>=100?p.toFixed(2):p>=1?p.toFixed(3):p>=0.01?p.toFixed(5):p.toPrecision(3);
+/* ---------- indicators ---------- */
+const sum=a=>a.reduce((x,y)=>x+y,0),mean=a=>sum(a)/a.length;
+const amax=a=>Math.max.apply(null,a),amin=a=>Math.min.apply(null,a);
+const argmax=a=>{let k=0;for(let i=1;i<a.length;i++)if(a[i]>a[k])k=i;return k;};
+function smaAt(c,i,n){if(i<n-1)return NaN;let s=0;for(let k=i-n+1;k<=i;k++)s+=c[k];return s/n;}
+function stdAt(c,i,n){if(i<n-1)return NaN;const m=smaAt(c,i,n);let s=0;for(let k=i-n+1;k<=i;k++)s+=(c[k]-m)*(c[k]-m);return Math.sqrt(s/(n-1));}
+function rsiSeries(c,n){
+  n=n||14;const a=1/n,N=c.length,rsi=new Array(N).fill(NaN);
+  let up=NaN,dn=NaN;
+  for(let i=1;i<N;i++){
+    const d=c[i]-c[i-1],u=Math.max(d,0),w=Math.max(-d,0);
+    if(i===1){up=u;dn=w;}else{up=(1-a)*up+a*u;dn=(1-a)*dn+a*w;}
+    rsi[i]=100-100/(1+up/dn);
+  }
+  return rsi;
+}
+function pivotHighs(h,k){ // swing highs: higher than the k weeks before and at least as high as the k weeks after
+  const out=[];
+  for(let i=k;i<h.length-k;i++){
+    let ok=true;
+    for(let j=1;j<=k;j++){if(!(h[i]>h[i-j])||!(h[i]>=h[i+j])){ok=false;break;}}
+    if(ok)out.push(h[i]);
+  }
+  return out;
+}
+function rsScore(c){ // IBD-style relative strength: 3, 6, 9, 12-month returns, the latest 3 months counted double
+  const n=c.length;if(n<40)return null;
+  const r=k=>c[n-1]/c[Math.max(0,n-1-k)]-1;
+  return 2*r(13)+r(26)+r(39)+r(Math.min(52,n-1));
+}
+function pctRank(vals){ // pandas rank(pct=True) of the LAST element, average method
+  const v=vals.filter(x=>isFinite(x));if(!v.length)return NaN;
+  const last=v[v.length-1];let less=0,eq=0;
+  for(const x of v){if(x<last)less++;else if(x===last)eq++;}
+  return (less+(eq+1)/2)/v.length;
+}
+
+/* ---------- the rules (same as the Python scanner) ---------- */
+function analyze(w){
+  const n=w.length,c=w.map(b=>b.close),h=w.map(b=>b.high),l=w.map(b=>b.low),v=w.map(b=>b.volume);
+  const last=c[n-1];
+  let uv=0;for(let i=n-4;i<n;i++)uv+=v[i]*c[i];uv/=4;
+  if(sum(v.slice(n-12))>0&&uv<CFG.MIN_VOL)return null; // skip the liquidity filter if the source has no volume
+  const hi26=amax(h.slice(n-27,n-1)),dist=(hi26-last)/hi26*100,brokeOut=last>hi26;
+
+  // fresh breakout: first close above its own prior-26w high within the lookback
+  let bo=null;
+  for(let k=CFG.LOOKBACK;k>=1;k--){
+    const i=n-k,level=amax(h.slice(i-26,i)),prev=amax(h.slice(i-27,i-1));
+    if(c[i]>level&&c[i-1]<=prev){bo={i:i,level:level,weeksAgo:k-1,volX:v[i]/mean(v.slice(i-12,i))};break;}
+  }
+  let earlyBo=false,ext=null,peak=null;
+  if(bo){
+    ext=(last-bo.level)/bo.level*100;
+    peak=(amax(h.slice(bo.i))-bo.level)/bo.level*100;
+    const holding=amin(c.slice(bo.i))>=bo.level*0.97;
+    earlyBo=holding&&ext>=0&&ext<=CFG.MAX_EXT&&peak<=CFG.MAX_EXT+10;
+  }
+  let resIdx=n-27+argmax(h.slice(n-27,n-1)),boIdx=-1;
+  if(earlyBo){boIdx=bo.i;resIdx=bo.i-26+argmax(h.slice(bo.i-26,bo.i));}
+
+  const sma20=smaAt(c,n-1,20),sma5=smaAt(c,n-5,20),sma13=smaAt(c,n-13,20);
+  const rsiS=rsiSeries(c),rsiNow=rsiS[n-1];
+  const bw=[],atr=[];
+  for(let i=Math.max(19,n-52);i<n;i++){bw.push(4*stdAt(c,i,20)/smaAt(c,i,20));}
+  const tr=[];for(let i=0;i<n;i++){tr.push(i===0?h[i]-l[i]:Math.max(h[i]-l[i],Math.abs(h[i]-c[i-1]),Math.abs(l[i]-c[i-1])));}
+  for(let i=Math.max(13,n-52);i<n;i++){atr.push(mean(tr.slice(i-13,i+1))/c[i]);}
+  const bwPct=pctRank(bw),atrPct=pctRank(atr);
+  const range4=amax(h.slice(n-4))-amin(l.slice(n-4)),range12=amax(h.slice(n-12))-amin(l.slice(n-12));
+  const volRatio=mean(v.slice(n-4))/mean(v.slice(n-12));
+  const base=(amax(h.slice(n-6))-amin(l.slice(n-6)))/last*100;
+
+  const R={
+    'BB squeeze':bwPct<=0.25,
+    'ATR compression':atrPct<=0.35,
+    'Volume up in base':volRatio>1.1&&range4<range12*0.6,
+    'Momentum':rsiNow>=50&&rsiNow<=70&&rsiNow>rsiS[n-5],
+    'Above rising 20w MA':last>sma20&&sma20>sma5,
+    'Tight base after run':sma20>sma13*1.05&&base<=20&&amin(l.slice(n-6))>sma20*0.97
+  };
+  const rules=Object.keys(R).filter(k=>R[k]);
+
+  // ---- extras (they do not decide listing; they describe how clean the setup is) ----
+  const tp=w.map(b=>(b.high+b.low+b.close)/3);
+  const anchor=earlyBo?bo.i:resIdx;                 // VWAP starts at the breakout week, or at the 26-week high
+  const vwSeries=new Array(n).fill(null);
+  {let pv=0,vv=0;for(let i=anchor;i<n;i++){pv+=tp[i]*v[i];vv+=v[i];vwSeries[i]=vv>0?pv/vv:null;}}
+  const vwapNow=vwSeries[n-1];
+  let vwap26=null;{let pv=0,vv=0;for(let i=n-26;i<n;i++){pv+=tp[i]*v[i];vv+=v[i];}vwap26=vv>0?pv/vv:null;}
+  const refPx=earlyBo?last:hi26;                    // resistance is looked for above this price
+  const cands=pivotHighs(h,3).filter(x=>x>refPx*1.005);
+  const histHigh=amax(h);if(histHigh>refPx*1.005)cands.push(histHigh);
+  cands.sort((a,b)=>a-b);
+  const groups=[];
+  for(const x of cands){const g=groups[groups.length-1];if(g&&x<=g.top*1.03){g.top=x;g.sum+=x;g.cnt++;}else groups.push({top:x,sum:x,cnt:1});}
+  const levels=groups.slice(0,3).map(g=>g.sum/g.cnt);
+  const room=levels.length?(levels[0]-refPx)/refPx*100:null;
+  const hasVol=sum(v.slice(n-12))>0;
+  const refI=earlyBo?bo.i:n-1,rng=h[refI]-l[refI],cloc=rng>0?(c[refI]-l[refI])/rng:null;
+  const quality=[
+    vwapNow==null?null:last>=vwapNow,
+    levels.length===0||room>=15,
+    cloc==null?null:cloc>=(earlyBo?0.7:0.6),
+    !hasVol?null:(earlyBo?bo.volX>=1.5:v[n-1]>=mean(v.slice(n-5,n-1)))
+  ];
+  // ---- trader rules (weekly versions of Weinstein, Minervini, O'Neil, Darvas, Turtle) ----
+  const s10=smaAt(c,n-1,10),s30=smaAt(c,n-1,30),s30b=smaAt(c,n-5,30),s40=smaAt(c,n-1,40),s40b=smaAt(c,n-5,40);
+  const win52=Math.min(52,n),hi52=amax(h.slice(n-win52)),lo52=amin(l.slice(n-win52));
+  const bs=earlyBo?bo.i-10:n-10,be=earlyBo?bo.i:n;                       // the 10 weeks that formed the base
+  const bHi=amax(h.slice(bs,be)),bLo=amin(l.slice(bs,be)),baseDepth=(bHi-bLo)/bHi*100;
+  const atr14=mean(tr.slice(n-14)),gate=earlyBo?bo.level:hi26;
+  const pro5=[
+    last>s30&&s30>s30b,                                                      // Weinstein: Stage 2
+    isNaN(s40b)?null:(last>s10&&s10>s30&&s30>s40&&s40>s40b),                 // Minervini: averages in order
+    last>=1.3*lo52&&last>=0.75*hi52,                                         // Minervini: off the lows, near the highs
+    earlyBo?ext<=5:dist<=5,                                                  // O'Neil: buy zone, do not chase
+    baseDepth<=35                                                            // O'Neil / Darvas: orderly base
+  ];
+  return {pro5,baseDepth,boxFloor:bLo,atr14,atrPct:atr14/last*100,lossLvl:gate*0.925,stop2N:last-2*atr14,t55:last>amax(h.slice(n-12,n-1)),
+    vwSeries,vwapNow,vwap26,levels,room,quality,cloc,brokeOut,earlyBo,dist,ext,peak,weeksAgo:bo?bo.weeksAgo:null,volX:bo?bo.volX:null,level:earlyBo?bo.level:hi26,
+    resIdx,boIdx,price:last,rsi:rsiNow,base,nRules:rules.length,rules};
+}
+
+/* ---------- build one view (live / confirmed) ---------- */
+const g6=x=>Number(Number(x).toPrecision(6)),r1=x=>Math.round(x*10)/10,r2=x=>Math.round(x*100)/100;
+function toItem(r){
+  const w=r.frame,n=w.length,off=Math.max(0,n-70),c=w.map(b=>b.close);
+  const sma=[];for(let i=off;i<n;i++){const s=smaAt(c,i,20);sma.push(isNaN(s)?null:g6(s));}
+  return {coin:r.coin,candles:w.slice(off).map(b=>[b.ts,g6(b.open),g6(b.high),g6(b.low),g6(b.close),g6(b.volume)]),sma:sma,
+    level:g6(r.level),resIdx:r.resIdx-off,boIdx:r.boIdx>=0?r.boIdx-off:-1,price:g6(r.price),dist:r1(r.dist),
+    ext:r.ext==null?null:r1(r.ext),weeksAgo:r.weeksAgo,volX:(r.volX==null||!isFinite(r.volX))?null:r2(r.volX),rsi:r1(r.rsi),base:r1(r.base),
+    nRules:r.nRules,rules:r.rules,mcap:r2(r.mcap/1e9),news:[],newsOk:true,
+    vwap:r.vwSeries.slice(off).map(x=>x==null?null:g6(x)),vwapNow:r.vwapNow==null?null:g6(r.vwapNow),vwap26:r.vwap26==null?null:g6(r.vwap26),
+    levels:r.levels.map(g6),room:r.room==null?null:r1(r.room),q:r.quality,cloc:r.cloc==null?null:r2(r.cloc),
+    pro:r.pro,rs:r.rs,rsBtc:r.rsBtc==null?null:r1(r.rsBtc),baseDepth:r1(r.baseDepth),boxFloor:g6(r.boxFloor),lossLvl:g6(r.lossLvl),stop2N:g6(r.stop2N),
+    atrPct:r1(r.atrPct),t55:r.t55};
+}
+/* ---------- Bitcoin backdrop: the same trader rules applied to BTC's weekly chart ---------- */
+function btcRegime(w){
+  const n=w.length;if(n<34)return null;
+  const c=w.map(b=>b.close),h=w.map(b=>b.high),l=w.map(b=>b.low),last=c[n-1],prev=c[n-2];
+  const s10=smaAt(c,n-1,10),s20=smaAt(c,n-1,20),s20b=smaAt(c,n-5,20),s30=smaAt(c,n-1,30),s30b=smaAt(c,n-5,30),s40=smaAt(c,n-1,40),s40b=smaAt(c,n-5,40);
+  const win=Math.min(52,n),hi52=amax(h.slice(n-win)),lo52=amin(l.slice(n-win));
+  const hi26=amax(h.slice(n-27,n-1)),lo26=amin(l.slice(n-27,n-1));
+  const rsi=rsiSeries(c)[n-1];
+  const st=(bu,be)=>bu?'bull':be?'bear':'neutral';
+  const dd=(hi52-last)/hi52*100,up=(last/lo52-1)*100;
+  const rules=[
+    {name:'Stage 2 or Stage 4',who:'Weinstein',state:st(last>s30&&s30>s30b,last<s30&&s30<s30b),
+     text:'Close $'+fmt(last)+' is '+(last>s30?'above':'below')+' the 30-week average ($'+fmt(s30)+'), which is '+(s30>s30b?'rising':'falling or flat')+'.'},
+    isNaN(s40b)?{name:'Averages in order',who:'Minervini',state:null,text:'Needs at least 44 weeks of history.'}:
+    {name:'Averages in order',who:'Minervini',state:st(last>s10&&s10>s30&&s30>s40&&s40>s40b,last<s10&&s10<s30&&s30<s40&&s40<s40b),
+     text:'10-week $'+fmt(s10)+', 30-week $'+fmt(s30)+', 40-week $'+fmt(s40)+'; the 40-week is '+(s40>s40b?'rising':'falling or flat')+'. Bullish needs price above 10 > 30 > 40, bearish the reverse.'},
+    {name:'Short-term trend',who:'Scanner rule',state:st(last>s20&&s20>s20b,last<s20&&s20<s20b),
+     text:'Close is '+(last>s20?'above':'below')+' the 20-week average ($'+fmt(s20)+'), which is '+(s20>s20b?'rising':'falling or flat')+'.'},
+    {name:'Momentum (RSI)',who:'Scanner rule',state:st(rsi>=50,rsi<=45),
+     text:'Weekly RSI is '+rsi.toFixed(0)+'. Bullish at 50 or more, bearish at 45 or less.'},
+    {name:'Position in the 52-week range',who:'Minervini',state:st(last>=0.75*hi52&&last>=1.3*lo52,dd>=40),
+     text:'Price is '+dd.toFixed(0)+'% below its 52-week high and '+up.toFixed(0)+'% above its 52-week low. Bullish: within 25% of the high and 30%+ off the low. Bearish: 40%+ below the high.'},
+    {name:'26-week breakout state',who:'Scanner rule',state:st(last>=0.94*hi26,last<=1.06*lo26),
+     text:last>=0.94*hi26?'Price is at or within 6% of the prior 26-week high ($'+fmt(hi26)+').':last<=1.06*lo26?'Price is at or within 6% of the prior 26-week low ($'+fmt(lo26)+').':'Price sits in the middle of its 26-week range ($'+fmt(lo26)+' to $'+fmt(hi26)+').'}
+  ];
+  const bull=rules.filter(r=>r.state==='bull').length,bear=rules.filter(r=>r.state==='bear').length;
+  let verdict='Neutral';
+  if(bull>=4&&bull-bear>=2)verdict='Bullish';else if(bear>=4&&bear-bull>=2)verdict='Bearish';
+  const lean=verdict==='Neutral'?(bull>bear?'leaning bullish':bear>bull?'leaning bearish':'mixed'):'';
+  const off=Math.max(0,n-110),ma=(k)=>{const o=[];for(let i=off;i<n;i++){const x=smaAt(c,i,k);o.push(isNaN(x)?null:g6(x));}return o;};
+  return {verdict,lean,bull,bear,rules,price:g6(last),chg:r1((last/prev-1)*100),rsi:r1(rsi),dd:r1(dd),s30:g6(s30),s40:isNaN(s40)?null:g6(s40),
+    item:{candles:w.slice(off).map(b=>[b.ts,g6(b.open),g6(b.high),g6(b.low),g6(b.close),g6(b.volume)]),sma:ma(30),
+      mas:[{n:'10w',c:'#58a6ff',d:ma(10)},{n:'30w',c:'#f59e0b',d:ma(30)},{n:'40w',c:'#a78bfa',d:ma(40)}],
+      level:g6(hi26),resIdx:n-27+argmax(h.slice(n-27,n-1))-off,boIdx:-1,price:g6(last),levels:[],vwap:[]}};
+}
+
+
+/* ---------- backtest core: walk forward through history, one week at a time, using only data known at that time ---------- */
+const BT={WIN:110,START:60,MAXHOLD:26,FEE:0.001,SLIP:0.002,MAXRISK:0.25,
+  STOPS:['pct','atr','floor'],EXITS:['trail10','t2r','t3r','res1']};
+const STOP_NAME={pct:'Stop 7.5% under breakout line',atr:'Stop 2x ATR under entry',floor:'Stop under base floor'};
+const EXIT_NAME={trail10:'Trail: exit on weekly close under 10w average',t2r:'Take profit at 2x risk',t3r:'Take profit at 3x risk',res1:'Take profit at first resistance'};
+
+// verdict of the Bitcoin backdrop for every week, using only that week and the ones before it
+function btcVerdicts(btc){
+  const m=new Map();
+  for(let i=0;i<btc.length;i++){
+    const w=btc.slice(Math.max(0,i-BT.WIN+1),i+1);
+    const r=w.length>=34?btcRegime(w):null;
+    m.set(btc[i].ts,r?r.verdict:null);
+  }
+  return m;
+}
+
+// one trade, all stop/exit combinations. i0 = index of the entry week (signal was the close of week i0-1)
+function runTrade(w,i0,sig,cost){
+  const c=w.map(b=>b.close);
+  const entryRaw=w[i0].open,entry=entryRaw*(1+cost);
+  const out={};
+  for(const sk of BT.STOPS){
+    let stop=sk==='pct'?sig.lossLvl:sk==='atr'?(entryRaw-2*sig.atr14):sig.boxFloor;
+    stop=Math.max(stop,entryRaw*(1-BT.MAXRISK));            // never risk more than 25%
+    if(!(stop<entryRaw*0.99))continue;                        // stop must sit clearly under the entry
+    const risk=entry-stop;
+    for(const ek of BT.EXITS){
+      let target=null;
+      if(ek==='t2r')target=entry+2*risk;
+      else if(ek==='t3r')target=entry+3*risk;
+      else if(ek==='res1'){const r1=sig.levels&&sig.levels[0];target=(r1&&r1>=entry+risk)?r1:entry+2*risk;}
+      let exit=null,why='',j=i0;
+      for(j=i0;j<w.length;j++){
+        const b=w[j];
+        if(b.open<=stop){exit=b.open;why='stop';break;}      // gapped through the stop
+        if(b.low<=stop){exit=stop;why='stop';break;}          // stop first: the cautious reading when both happen in one week
+        if(target!=null){
+          if(b.open>=target){exit=b.open;why='target';break;}
+          if(b.high>=target){exit=target;why='target';break;}
+        }
+        if(ek==='trail10'&&j>i0){const s=smaAt(c,j,10);if(!isNaN(s)&&b.close<s){exit=b.close;why='trail';break;}}
+        if(j-i0>=BT.MAXHOLD){exit=b.close;why='time';break;}
+      }
+      if(exit==null){j=w.length-1;exit=w[j].close;why='open';}
+      const net=exit*(1-cost);
+      out[sk+'|'+ek]={r:(net-entry)/risk,ret:(net/entry-1)*100,wk:j-i0+1,why:why};
+    }
+  }
+  return out;
+}
+
+// all trades for one coin
+function simulateCoin(sym,w,btcV){
+  const cost=BT.FEE+BT.SLIP,trades=[];
+  let busyUntil=-1;
+  for(let t=BT.START;t<w.length-1;t++){
+    if(t<busyUntil)continue;
+    const win=w.slice(Math.max(0,t-BT.WIN+1),t+1);
+    if(win.length<CFG.MIN_WEEKS)continue;
+    const r=analyze(win);if(!r)continue;
+    let type=null;
+    if(r.earlyBo&&r.rsi<75)type='early';
+    else if(!r.brokeOut&&!r.earlyBo&&r.dist<=CFG.MAX_DIST&&r.nRules>=CFG.MIN_RULES)type='near';
+    if(!type)continue;
+    const res=runTrade(w,t+1,r,cost);
+    const keys=Object.keys(res);if(!keys.length)continue;
+    let last=0;keys.forEach(k=>{last=Math.max(last,res[k].wk);});
+    busyUntil=t+1+Math.min(...keys.map(k=>res[k].wk)); // simplest honest rule: no new signal on this coin while the fastest variant is still open
+    trades.push({coin:sym,ts:w[t].ts,type:type,btc:btcV.get(w[t].ts)||null,pro:(r.pro5||[]).filter(x=>x===true).length,res:res});
+  }
+  return trades;
+}
+
+/* ---------- statistics ---------- */
+function stats(list,key){
+  const rs=[],rets=[],wks=[];
+  for(const t of list){const x=t.res[key];if(x){rs.push(x.r);rets.push(x.ret);wks.push(x.wk);}}
+  const n=rs.length;if(!n)return null;
+  const win=rets.filter(x=>x>0).length,gp=sum(rets.filter(x=>x>0)),gl=-sum(rets.filter(x=>x<=0));
+  const sorted=rets.slice().sort((a,b)=>a-b),med=sorted[Math.floor(n/2)];
+  // account curve: risk 1% of the account per trade, trades taken in the order they were signalled
+  const order=list.filter(t=>t.res[key]).sort((a,b)=>a.ts-b.ts);
+  let eq=1,peak=1,dd=0;
+  for(const t of order){eq*=1+0.01*Math.max(-1,t.res[key].r);peak=Math.max(peak,eq);dd=Math.max(dd,(peak-eq)/peak);}
+  return {n:n,win:win/n*100,avgRet:mean(rets),med:med,avgR:mean(rs),pf:gl>0?gp/gl:(gp>0?99:0),wk:mean(wks),dd:dd*100,eq:(eq-1)*100,worst:sorted[0]};
+}
+function filterTrades(all,o){
+  return all.filter(t=>{
+    if(o.type!=='both'&&t.type!==o.type)return false;
+    if(o.btc==='notbear'&&t.btc==='Bearish')return false;
+    if(o.btc==='bull'&&t.btc!=='Bullish')return false;
+    if(o.pro&&t.pro<o.pro)return false;
+    if(o.from&&t.ts<o.from)return false;
+    if(o.to&&t.ts>=o.to)return false;
+    return true;
+  });
+}
+
+/* ---------- data ---------- */
+const $=id=>document.getElementById(id);
+let TRADES=[],META={};
+async function jget(url,tries){tries=tries||3;for(let a=0;a<tries;a++){try{const r=await fetch(url);if(r.status===429){await sleep(4000*(a+1));continue;}if(r.status===451||r.status===403){const e=new Error('REGION');e.region=true;throw e;}if(!r.ok)return null;return await r.json();}catch(e){if(e.region)throw e;if(a===tries-1)throw e;await sleep(1200*(a+1));}}return null;}
+async function klines(sym){
+  const j=await jget('https://data-api.binance.vision/api/v3/klines?symbol='+encodeURIComponent(sym)+'USDT&interval=1w&limit=1000');
+  if(!Array.isArray(j))return null;
+  const w=j.map(x=>({ts:+x[0],open:+x[1],high:+x[2],low:+x[3],close:+x[4],volume:+x[5]})).filter(b=>b.close>0&&b.high>0&&b.low>0);
+  if(w.length&&w[w.length-1].ts+7*864e5>Date.now())w.pop();          // drop the unfinished current week
+  return w.length>=CFG.MIN_WEEKS+30?w:null;
+}
+function log(t){$('log').textContent=t;}
+async function run(){
+  const btn=$('run');btn.disabled=true;$('pb').style.width='0';
+  BT.FEE=(+$('fee').value||0)/100;BT.SLIP=(+$('slip').value||0)/100;
+  try{
+    log('Loading the top 200 coin list...');
+    const list=await jget('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=200&page=1');
+    if(!Array.isArray(list))throw new Error('Could not load the coin list. Wait a minute and try again.');
+    const coins=list.filter(c=>!EXCLUDE.has(String(c.symbol).toLowerCase())).map(c=>({sym:String(c.symbol).toUpperCase(),price:c.current_price}));
+    log('Loading Bitcoin history...');
+    const btc=await klines('BTC');
+    if(!btc)throw new Error('Could not load Bitcoin history from the public data server.');
+    const bv=btcVerdicts(btc);
+    let all=[],done=0,used=0,skipped=0,idx=0;
+    const worker=async()=>{
+      while(idx<coins.length){
+        const c=coins[idx++];
+        try{
+          const w=await klines(c.sym);
+          if(w){
+            const lc=w[w.length-1].close,ratio=c.price?lc/c.price:1;
+            if(!c.price||(ratio>=0.75&&ratio<=1.33)){const t=simulateCoin(c.sym,w,bv);all=all.concat(t);used++;}else skipped++;
+          }else skipped++;
+        }catch(e){if(e.region)throw e;skipped++;}
+        done++;$('pb').style.width=(done/coins.length*100)+'%';
+        log('Testing coin '+done+' of '+coins.length+' ('+all.length+' trades so far)');
+      }
+    };
+    await Promise.all([worker(),worker(),worker()]);
+    TRADES=all;META={used:used,skipped:skipped,at:Date.now()};
+    try{localStorage.setItem('bt_trades_v1',JSON.stringify({t:all.map(t=>({c:t.coin,s:t.ts,y:t.type,b:t.btc,p:t.pro,r:Object.fromEntries(Object.entries(t.res).map(([k,v])=>[k,[+v.r.toFixed(3),+v.ret.toFixed(2),v.wk]]))})),m:META}));}catch(e){}
+    log('Done: '+used+' coins tested, '+skipped+' skipped (not listed on the public data feed), '+all.length+' trades.');
+    show();
+  }catch(e){
+    log(e.region?'The public market-data server is not available in your region. Try again with a different connection.':String((e&&e.message)||e));
+  }
+  btn.disabled=false;
+}
+function load(){
+  try{const j=JSON.parse(localStorage.getItem('bt_trades_v1'));if(!j)return;
+    TRADES=j.t.map(t=>({coin:t.c,ts:t.s,type:t.y,btc:t.b,pro:t.p,res:Object.fromEntries(Object.entries(t.r).map(([k,v])=>[k,{r:v[0],ret:v[1],wk:v[2]}]))}));META=j.m||{};
+    log('Loaded the last run ('+TRADES.length+' trades, '+new Date(META.at||0).toLocaleDateString()+'). Press Run to refresh.');show();}catch(e){}
+}
+/* ---------- display ---------- */
+const nm=k=>{const [s,e]=k.split('|');return {pct:'7.5% stop',atr:'2xATR stop',floor:'Base-floor stop'}[s]+' + '+{trail10:'10w trail',t2r:'2R target',t3r:'3R target',res1:'Resistance target'}[e];};
+const cl=(x,g)=>x>(g||0)?'pos':x<(g||0)?'neg':'';
+const f1=x=>(x>=0?'+':'')+x.toFixed(1);
+function cur(){return {type:$('f_type').value,btc:$('f_btc').value,pro:+$('f_pro').value};}
+function perRange(o){
+  const ts=TRADES.map(t=>t.ts).sort((a,b)=>a-b),mid=ts[Math.floor(ts.length/2)]||0;
+  return o==='h1'?{to:mid}:o==='h2'?{from:mid}:{};
+}
+function rowHtml(label,s,best,minN){
+  if(!s)return '<tr><td>'+label+'</td><td colspan="6"><small>no trades</small></td></tr>';
+  return '<tr class="'+(best?'best':'')+'"><td>'+label+(s.n<(minN||20)?' <small>(few trades)</small>':'')+'</td><td>'+s.n+'</td><td>'+s.win.toFixed(0)+'%</td><td class="'+cl(s.avgRet)+'">'+f1(s.avgRet)+'%</td><td class="'+cl(s.avgR)+'">'+(s.avgR>=0?'+':'')+s.avgR.toFixed(2)+'</td><td class="'+cl(s.pf,1)+'">'+s.pf.toFixed(2)+'</td><td>'+s.dd.toFixed(0)+'%</td></tr>';
+}
+const HEAD='<tr><th></th><th>Trades</th><th>Win</th><th>Avg</th><th>R</th><th>PF</th><th>Max DD</th></tr>';
+function show(){
+  if(!TRADES.length){$('out').style.display='none';return;}
+  $('out').style.display='block';
+  const o=cur(),pr=perRange($('f_per').value),list=filterTrades(TRADES,Object.assign({},o,pr));
+  const keys=[];BT.STOPS.forEach(s=>BT.EXITS.forEach(e=>keys.push(s+'|'+e)));
+  const rows=keys.map(k=>({k:k,s:stats(list,k)})).filter(r=>r.s).sort((a,b)=>b.s.avgR-a.s.avgR);
+  $('tbl').innerHTML=HEAD+(rows.length?rows.map((r,i)=>rowHtml(nm(r.k),r.s,i===0)).join(''):'<tr><td colspan="7"><small>No trades with these filters.</small></td></tr>');
+  const best=(rows.find(r=>r.s.n>=20)||rows[0]);
+  if(!best){$('btctbl').innerHTML='';$('pertbl').innerHTML='';$('verdict').innerHTML='No trades.';return;}
+  const bk=best.k;
+  $('btctbl').innerHTML=HEAD+[['all','Ignore Bitcoin'],['notbear','Skip when Bearish'],['bull','Only when Bullish']].map(([v,l])=>rowHtml(l,stats(filterTrades(TRADES,Object.assign({},o,pr,{btc:v})),bk),false)).join('');
+  const h1=perRange('h1'),h2=perRange('h2');
+  $('pertbl').innerHTML=HEAD+rowHtml('First half',stats(filterTrades(TRADES,Object.assign({},o,h1)),bk))+rowHtml('Second half',stats(filterTrades(TRADES,Object.assign({},o,h2)),bk));
+  // verdict from the unfiltered-period best combination
+  const a=stats(filterTrades(TRADES,Object.assign({},o,h1)),bk),b=stats(filterTrades(TRADES,Object.assign({},o,h2)),bk),w=best.s;
+  let cls='v-no',head='No reliable edge found',txt='With these settings the results are not good enough, or not consistent enough, to automate.';
+  const good=w.n>=30&&w.avgR>=0.2&&w.pf>=1.3;
+  if(good&&a&&b&&a.avgR>0&&b.avgR>0&&a.n>=10&&b.n>=10){cls='v-ok';head='Worth testing further';txt='Profitable in both halves of the history. Still biased upward by survivorship, so next comes paper trading, not real money.';}
+  else if(good){cls='v-mid';head='Mixed';txt='Profitable overall but not in both halves of the history, or too few trades in one half. Treat with suspicion.';}
+  $('verdict').innerHTML='<span class="pill '+cls+'">'+head+'</span><p>'+txt+'</p><small>Best combination: <b>'+nm(bk)+'</b>. '+w.n+' trades, '+w.win.toFixed(0)+'% winners, average '+f1(w.avgRet)+'% per trade after costs, profit factor '+w.pf.toFixed(2)+', worst losing streak drawdown '+w.dd.toFixed(0)+'%.</small>';
+}
+['f_type','f_btc','f_pro','f_per'].forEach(i=>$(i).addEventListener('change',show));
+$('run').addEventListener('click',run);
+load();
+</script></body></html>
